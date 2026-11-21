@@ -1,0 +1,659 @@
+@import "tailwindcss";
+
+@theme {
+  --color-nucleo: #461D77;
+  --color-litio: #461D77;
+  --color-ionizado: #15803D;
+  --color-violeta: #461D77;
+  --color-calido: #ECEAE3;
+  --color-stone-surface: #FFFFFF;
+  --color-stone-muted: #E3E0D7;
+  --color-stone-well: #F3F1EC;
+  --color-stone-border: #D8D4CA;
+  --color-tecnico: #181615;
+  --color-mineral: #B45309;
+  --color-levanda: #E3E0D7;
+  --color-lavanda: #E3E0D7;
+}
+
+.page-break-before {
+  page-break-before: always;
+  break-before: page;
+}
+
+.page-break-after {
+  page-break-after: always;
+  break-after: page;
+}
+
+.no-page-break {
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* Forzar diseño de bloque para evitar fallos de salto de página en Flexbox */
+  #dashboard-report, 
+  .flex-col, 
+  .grid {
+    display: block !important;
+    overflow: visible !important;
+  }
+
+  #dashboard-report {
+    width: 216mm !important; /* Ancho Legal */
+    margin: 0 auto !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+  
+  .page-break-before {
+    page-break-before: always !important;
+    break-before: page !important;
+    display: block !important;
+    width: 100% !important;
+  }
+
+  .page-break-after {
+    page-break-after: always !important;
+    break-after: page !important;
+    display: block !important;
+    width: 100% !important;
+  }
+
+  .no-page-break,
+  .bg-white.p-5,
+  .bg-white.p-6,
+  .grid-cols-4 > div,
+  .grid-cols-3 > div {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+}
+
+/* Regla global para exportación PDF: fondo blanco limpio en cada sección capturada */
+.is-exporting #dashboard-report * {
+    outline: none !important;
+}
+
+/* Reglas de simulación de impresión durante la exportación a PDF (html2canvas) */
+.is-exporting .no-print,
+.is-exporting .no-pdf {
+    display: none !important;
+}
+
+.is-exporting .print\:block {
+    display: block !important;
+}
+
+.is-exporting .print\:flex {
+    display: flex !important;
+}
+
+
+/* Reglas para ocultar barras de desplazamiento en capturas y elementos interactivos */
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+@layer base {
+  html {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    background-color: #ECEAE3;
+    color: #181615;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3 {
+    letter-spacing: -0.025em;
+  }
+
+  .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace !important;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Crisp Editorial Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #E3E0D7;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #BDB8AC;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #461D77;
+}
+
+.live-sync-indicator {
+  transition: opacity 150ms ease-out;
+}
+
+.carousel-container {
+  perspective: 1000px;
+}
+
+.carousel-slide {
+  transition: transform 200ms ease-out, opacity 200ms ease-out;
+}
+
+/* Architectural Surface Hierarchy (4 tiers, zero neon glow) */
+.surface-card {
+  background-color: #FFFFFF;
+  border: 1px solid #D8D4CA;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 2px rgba(24, 22, 21, 0.05),
+    0 8px 20px -8px rgba(24, 22, 21, 0.08);
+}
+
+.surface-card-interactive {
+  background-color: #FFFFFF;
+  border: 1px solid #D8D4CA;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 2px rgba(24, 22, 21, 0.05),
+    0 6px 16px -6px rgba(24, 22, 21, 0.07);
+  transition: border-color 150ms ease-out, box-shadow 150ms ease-out, transform 150ms ease-out, background-color 150ms ease-out;
+}
+.surface-card-interactive:hover {
+  border-color: #461D77;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    0 2px 6px rgba(24, 22, 21, 0.07),
+    0 14px 26px -10px rgba(70, 29, 119, 0.16);
+  transform: translateY(-1px);
+}
+
+.surface-well {
+  background-color: #F2F0EA;
+  border: 1px solid #D5D0C5;
+  box-shadow: inset 0 1px 2px rgba(24, 22, 21, 0.05);
+}
+
+.surface-anchor-dark {
+  background-color: #181615;
+  color: #F7F6F2;
+  border: 1px solid #181615;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 2px 6px rgba(24, 22, 21, 0.16),
+    0 12px 24px -8px rgba(24, 22, 21, 0.22);
+}
+
+.surface-anchor-violet {
+  background-color: #461D77;
+  color: #FFFFFF;
+  border: 1px solid #381661;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    0 2px 6px rgba(70, 29, 119, 0.2),
+    0 12px 24px -8px rgba(70, 29, 119, 0.28);
+}
+
+.premium-hover-card {
+  transition: border-color 150ms ease-out, background-color 150ms ease-out, box-shadow 150ms ease-out;
+}
+.premium-hover-card:hover {
+  border-color: #B8B2A4;
+}
+
+.premium-btn-transition {
+  transition: background-color 150ms ease-out, border-color 150ms ease-out, color 150ms ease-out, opacity 150ms ease-out;
+}
+
+.premium-glass {
+  background: #FFFFFF;
+  border: 1px solid #D8D4CA;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 2px rgba(24, 22, 21, 0.05),
+    0 8px 20px -8px rgba(24, 22, 21, 0.08);
+}
+
+/* Dense editorial tables */
+.premium-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.premium-table th {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  background-color: #E7E4DC;
+  color: #44403C;
+  border-bottom: 1px solid #D8D4CA;
+  padding: 10px 14px;
+}
+.premium-table td {
+  padding: 10px 14px;
+  font-size: 13px;
+  border-bottom: 1px solid #E5E2D9;
+  transition: background-color 150ms ease-out;
+}
+.premium-table tr:hover td {
+  background-color: #F5F3EE !important;
+}
+
+/* Crisp focus states */
+input, select, textarea {
+  transition: border-color 150ms ease-out, box-shadow 150ms ease-out;
+}
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: none;
+  border-color: #461D77 !important;
+  box-shadow: 0 0 0 2px rgba(70, 29, 119, 0.16);
+}
+
+/* Origami Paper Plane Animation (@keyframes sb-fold & facets) */
+@property --sb-corner-l-x {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 0%;
+}
+@property --sb-corner-r-x {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 100%;
+}
+@property --sb-wing-l-x {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 0%;
+}
+@property --sb-wing-r-x {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 100%;
+}
+@property --sb-notch-y {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 100%;
+}
+@property --sb-nose-y {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 0%;
+}
+@property --sb-wing-y {
+  syntax: '<percentage>';
+  inherits: true;
+  initial-value: 100%;
+}
+
+/* one sheet, cut in half; each facet is four named vertices and never moves */
+.facet--left {
+  clip-path: polygon(
+    var(--sb-corner-l-x, 0%) var(--sb-nose-y, 0%),
+    50% var(--sb-nose-y, 0%),
+    50% var(--sb-notch-y, 100%),
+    var(--sb-wing-l-x, 0%) var(--sb-wing-y, 100%)
+  );
+}
+
+.facet--right {
+  clip-path: polygon(
+    50% var(--sb-nose-y, 0%),
+    var(--sb-corner-r-x, 100%) var(--sb-nose-y, 0%),
+    var(--sb-wing-r-x, 100%) var(--sb-wing-y, 100%),
+    50% var(--sb-notch-y, 100%)
+  );
+}
+
+/* registering them makes them interpolable, so the whole fold is one keyframes rule */
+@keyframes sb-fold {
+  0% {
+    --sb-corner-l-x: 0%;
+    --sb-corner-r-x: 100%;
+    --sb-wing-l-x: 0%;
+    --sb-wing-r-x: 100%;
+    --sb-notch-y: 100%;
+    --sb-nose-y: 0%;
+    --sb-wing-y: 100%;
+    rotate: 0deg;
+  }
+  /* corners to the top centre */
+  45% {
+    --sb-corner-l-x: 50%;
+    --sb-corner-r-x: 50%;
+    --sb-wing-l-x: 0%;
+    --sb-wing-r-x: 100%;
+    --sb-notch-y: 100%;
+  }
+  /* wings in, notch up, crease */
+  78% {
+    --sb-corner-l-x: 50%;
+    --sb-corner-r-x: 50%;
+    --sb-wing-l-x: 12%;
+    --sb-wing-r-x: 88%;
+    --sb-notch-y: 61%;
+    rotate: 0deg;
+  }
+  /* and tip into the wind */
+  100% {
+    --sb-corner-l-x: 50%;
+    --sb-corner-r-x: 50%;
+    --sb-wing-l-x: 12%;
+    --sb-wing-r-x: 88%;
+    --sb-notch-y: 61%;
+    rotate: 55deg;
+  }
+}
+
+/* Direct polygon fallbacks ensuring 100% cross-browser frame interpolation */
+@keyframes sb-fold-facet-left {
+  0% {
+    clip-path: polygon(0% 0%, 50% 0%, 50% 100%, 0% 100%);
+  }
+  45% {
+    clip-path: polygon(50% 0%, 50% 0%, 50% 100%, 0% 100%);
+  }
+  78% {
+    clip-path: polygon(50% 0%, 50% 0%, 50% 61%, 12% 100%);
+  }
+  100% {
+    clip-path: polygon(50% 0%, 50% 0%, 50% 61%, 12% 100%);
+  }
+}
+
+@keyframes sb-fold-facet-right {
+  0% {
+    clip-path: polygon(50% 0%, 100% 0%, 100% 100%, 50% 100%);
+  }
+  45% {
+    clip-path: polygon(50% 0%, 50% 0%, 100% 100%, 50% 100%);
+  }
+  78% {
+    clip-path: polygon(50% 0%, 50% 0%, 88% 100%, 50% 61%);
+  }
+  100% {
+    clip-path: polygon(50% 0%, 50% 0%, 88% 100%, 50% 61%);
+  }
+}
+
+/* Flight and glide keyframe */
+@keyframes sb-takeoff-flight {
+  0% {
+    transform: translate(0, 0) rotate(55deg) scale(1);
+    opacity: 1;
+  }
+  25% {
+    transform: translate(22px, -8px) rotate(48deg) scale(1.08);
+    opacity: 1;
+  }
+  70% {
+    transform: translate(110px, -32px) rotate(54deg) scale(0.85);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(220px, -55px) rotate(58deg) scale(0.3);
+    opacity: 0;
+  }
+}
+
+/* ==========================================================================
+   Excel Upload & Completion Animations (Cargar Datos / Base Excel)
+   ========================================================================== */
+
+/* Laser scanner beam effect */
+@keyframes excel-laser-scanner {
+  0% {
+    top: -10%;
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    top: 110%;
+    opacity: 0;
+  }
+}
+
+/* Success expanding ripple ring */
+@keyframes success-ripple-wave {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+/* Shimmer on progress bar */
+@keyframes progress-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* Floating data particle ascending */
+@keyframes data-particle-ascend {
+  0% {
+    transform: translateY(12px) scale(0.5);
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(0px) scale(1);
+  }
+  100% {
+    transform: translateY(-16px) scale(0.6);
+    opacity: 0;
+  }
+}
+
+/* Spring pop for success badge */
+@keyframes success-pop-bounce {
+  0% {
+    transform: scale(0) rotate(-45deg);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.22) rotate(6deg);
+    opacity: 1;
+  }
+  80% {
+    transform: scale(0.95) rotate(-2deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+    opacity: 1;
+  }
+}
+
+/* Subtle border marching dash */
+@keyframes border-dash-crawl {
+  to {
+    stroke-dashoffset: -40;
+  }
+}
+
+/* ==========================================================================
+   File Download & Export Animations (PDF & PNG Buttons)
+   ========================================================================== */
+
+/* Downward arrow plunge into tray */
+@keyframes download-arrow-plunge {
+  0% {
+    transform: translateY(-8px);
+    opacity: 0;
+  }
+  40% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  70% {
+    transform: translateY(3px);
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Tray bounce responding to arrow arrival */
+@keyframes download-tray-bounce {
+  0%, 100% {
+    transform: scaleX(1) scaleY(1);
+  }
+  45% {
+    transform: scaleX(1.18) scaleY(0.85);
+  }
+  75% {
+    transform: scaleX(0.95) scaleY(1.08);
+  }
+}
+
+/* Paper feed animation for PDF generation */
+@keyframes paper-sheet-slide {
+  0% {
+    transform: translateY(-10px) scale(0.85);
+    opacity: 0;
+  }
+  35% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+  75% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(12px) scale(0.85);
+    opacity: 0;
+  }
+}
+
+/* Camera snapshot flash */
+@keyframes camera-shutter-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.15);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.4);
+  }
+}
+
+/* Shimmer gleam for hover and processing */
+@keyframes button-sweep-gleam {
+  0% {
+    transform: translateX(-120%) skewX(-20deg);
+  }
+  100% {
+    transform: translateX(220%) skewX(-20deg);
+  }
+}
+
+/* ==========================================================================
+   Firebase Cloud Sync Animations (Guardar Historial en Firebase)
+   ========================================================================== */
+
+/* Cloud gently floating with micro bounce */
+@keyframes cloud-float-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2.5px);
+  }
+}
+
+/* Upward data pulse entering the cloud */
+@keyframes cloud-data-ascend {
+  0% {
+    transform: translateY(8px) scale(0.6);
+    opacity: 0;
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  80% {
+    transform: translateY(-8px) scale(0.7);
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateY(-14px) scale(0.3);
+    opacity: 0;
+  }
+}
+
+/* Luminous cloud aura pulse during sync */
+@keyframes cloud-energy-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(113, 119, 236, 0.4), inset 0 0 12px rgba(255, 255, 255, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(113, 119, 236, 0), inset 0 0 20px rgba(255, 255, 255, 0.25);
+  }
+}
+
+/* Control Room Kiosk Mode: auto-hide cursor on inactivity */
+body.control-room-cursor-hidden,
+body.control-room-cursor-hidden * {
+  cursor: none !important;
+}
+
+/* Gradient background shift for active upload */
+@keyframes gradient-cloud-flow {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+
