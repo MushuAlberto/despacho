@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function validRole(role) {
+      return role in ['admin', 'jefe_turno', 'supervision'];
+    }
+
+    function validOptionalString(field, maxSize) {
+      return !(field in incoming()) || (incoming()[field] is string && incoming()[field].size() <= maxSize);
+    }
+
+    function validOptionalBool(field) {
+      return !(field in incoming()) || incoming()[field] is bool;
+    }
+
+    function validUserProfile() {
+      return incoming().keys().hasOnly([
+          'uid', 'userId', 'entraOid', 'username', 'password', 'name', 'email', 'role',
+          'enableAi', 'active', 'lastLogin', 'lastPasswordUpdate'
+        ])
+        && incoming().name is string && incoming().name.size() > 0 && incoming().name.size() <= 128
+        && incoming().role is string && validRole(incoming().role)
+        && validOptionalString('uid', 128)
+        && validOptionalString('userId', 128)
+        && validOptionalString('entraOid', 128)
+        && validOptionalString('username', 128)
+        && validOptionalString('password', 256)
+        && validOptionalString('email', 256)
+        && validOptionalString('lastLogin', 64)
+        && validOptionalString('lastPasswordUpdate', 64)
+        && validOptionalBool('enableAi')
+        && validOptionalBool('active');
+    }
+
+    function validActivityLog(logId) {
+      return isValidId(logId)
+        && incoming().keys().hasOnly(['userId', 'username', 'name', 'role', 'action', 'details', 'timestamp'])
+        && incoming().userId is string && incoming().userId.size() <= 128
+        && incoming().username is string && incoming().username.size() <= 128
+        && incoming().name is string && incoming().name.size() <= 128
+        && incoming().role is string && incoming().role.size() <= 128
+        && incoming().action is string && incoming().action.size() <= 256
+        && validOptionalString('details', 1000)
+        && incoming().timestamp is string && incoming().timestamp.size() <= 64;
+    }
+
+    function validGalleryImage(imageId) {
+      return isValidId(imageId)
+        && incoming().keys().hasOnly(['id', 'url', 'name', 'date', 'createdAt'])
+        && incoming().url is string && incoming().url.size() <= 1048500
+        && incoming().name is string && incoming().name.size() <= 256
+        && incoming().date is string && incoming().date.size() <= 128
+        && incoming().createdAt is string && incoming().createdAt.size() <= 64;
+    }
+
+    function validOperationalReport(reportId) {
+      return isValidId(reportId)
+        && incoming().keys().hasOnly(['id', 'date', 'backupData', 'updatedAt', 'updatedBy', 'summary'])
+        && incoming().id is string && incoming().id == reportId && incoming().id.size() <= 128
+        && incoming().date is string && incoming().date.size() <= 128
+        && incoming().backupData is string && incoming().backupData.size() <= 1048500
+        && incoming().updatedAt is string && incoming().updatedAt.size() <= 64
+        && validOptionalString('updatedBy', 128)
+        && validOptionalString('summary', 256);
+    }
+
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if isValidId(userId) && validUserProfile();
+      allow delete: if isValidId(userId);
+    }
+
+    match /activity_logs/{logId} {
+      allow read: if true;
+      allow create: if validActivityLog(logId);
+      allow update: if false;
+      allow delete: if true;
+    }
+
+    match /system_config/{configId} {
+      allow read, write: if true;
+    }
+
+    match /gallery_images/{imageId} {
+      allow read: if true;
+      allow create, update: if validGalleryImage(imageId);
+      allow delete: if true;
+    }
+
+    match /operational_reports/{reportId} {
+      allow read: if true;
+      allow create, update: if validOperationalReport(reportId);
+      allow delete: if true;
+    }
+
+    match /test/{docId} {
+      allow read: if true;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

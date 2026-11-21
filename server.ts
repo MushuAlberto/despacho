@@ -1,0 +1,1095 @@
+import express from "express";
+import http from "http";
+import path from "path";
+import dotenv from "dotenv";
+import PDFDocument from "pdfkit";
+import * as XLSX from "xlsx";
+import crypto from "crypto";
+import firebaseConfig from "./firebase-applet-config.json";
+import type { NextFunction, Request, Response } from "express";
+// @ts-ignore
+import httpntlm from "httpntlm";
+import {
+  securityHeadersMiddleware,
+  createCorsAllowlistMiddleware,
+  sanitizeInputMiddleware,
+  createRateLimiter
+} from "./server/securityMiddleware";
+import {
+  withExponentialBackoff,
+  HttpServiceError,
+  defaultShouldRetry
+} from "./server/resilience";
+
+dotenv.config();
+
+const app = express();
+app.set('trust proxy', 1);
+
+const extraCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const apiGeneralLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 60, keyPrefix: 'api-general' });
+const aiEndpointLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 15, keyPrefix: 'api-ai' });
+const stokesEndpointLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 10, keyPrefix: 'api-stokes' });
+
+app.use(securityHeadersMiddleware);
+app.use('/api', createCorsAllowlistMiddleware(extraCorsOrigins));
+app.use(express.json({ limit: '10mb' }));
+app.use('/api', sanitizeInputMiddleware);
+app.use('/api', apiGeneralLimiter);
+
+type AuthenticatedRequest = Request & {
+  auth?: {
+    uid: string;
+    email?: string;
+  };
+};
+
+type FirebaseCertCache = {
+  expiresAt: number;
+  certs: Record<string, string>;
+};
+
+const firebaseProjectId = process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId;
+let firebaseCertCache: FirebaseCertCache | null = null;
+
+const MAX_AI_BODY_CHARS = 150_000;
+const MAX_PDF_ROWS = 150;
+const MAX_ANALYSIS_CHARS = 20_000;
+const MAX_STOKES_PARAM_CHARS = 128;
+
+const decodeBase64Url = (value: string): Buffer => {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=');
+  return Buffer.from(padded, 'base64');
+};
+
+const safeJsonParse = <T,>(value: string): T | null => {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+};
+
+const jsonSize = (value: unknown): number => {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+};
+
+const cleanText = (value: unknown, maxLength: number): string => {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, maxLength);
+};
+
+const cleanFilenamePart = (value: unknown, fallback = 'SQM'): string => {
+  const cleaned = cleanText(value, 80).replace(/[^\w\s.-]/g, '').replace(/\s+/g, '_');
+  return cleaned || fallback;
+};
+
+const toFiniteNumber = (value: unknown, fallback = 0): number => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const sanitizeOperationalRows = (rows: unknown, maxRows = MAX_PDF_ROWS): any[] => {
+  if (!Array.isArray(rows)) return [];
+  return rows.slice(0, maxRows).map((item) => {
+    const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    return {
+      name: cleanText(row.name || row.producto, 120),
+      producto: cleanText(row.producto || row.name, 120),
+      Ton_Prog: toFiniteNumber(row.Ton_Prog),
+      Ton_Real: toFiniteNumber(row.Ton_Real),
+      Eq_Prog: toFiniteNumber(row.Eq_Prog),
+      Eq_Real: toFiniteNumber(row.Eq_Real),
+      faenaMetaHours: toFiniteNumber(row.faenaMetaHours),
+      faenaRealHours: toFiniteNumber(row.faenaRealHours)
+    };
+  });
+};
+
+const sanitizeComplianceRows = (rows: unknown): any[] => {
+  if (!Array.isArray(rows)) return [];
+  return rows.slice(0, 15).map((item) => {
+    const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    return {
+      fecha: cleanText(row.fecha || row.date || row.Fecha, 32),
+      producto: cleanText(row.producto || row.Producto || row.title, 120),
+      justificacion: cleanText(row.justificacion || row.comentarios || row["JUSTIFICACIÓN DE DESEMPEÑO"], 1200)
+    };
+  }).filter(row => row.justificacion);
+};
+
+const isAllowedModel = (model: unknown): model is 'gemini' | 'glm' => {
+  return model === 'gemini' || model === 'glm';
+};
+
+const getFirebasePublicCerts = async (): Promise<Record<string, string>> => {
+  if (firebaseCertCache && firebaseCertCache.expiresAt > Date.now()) {
+    return firebaseCertCache.certs;
+  }
+
+  return withExponentialBackoff(
+    async (signal) => {
+      const response = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com', {
+        signal
+      });
+      if (!response.ok) {
+        throw new HttpServiceError('No se pudieron obtener los certificados públicos de Firebase.', response.status);
+      }
+
+      const cacheControl = response.headers.get('cache-control') || '';
+      const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
+      const maxAgeMs = maxAgeMatch ? Number(maxAgeMatch[1]) * 1000 : 60 * 60 * 1000;
+      const certs = await response.json() as Record<string, string>;
+      firebaseCertCache = {
+        certs,
+        expiresAt: Date.now() + Math.max(maxAgeMs - 60_000, 60_000)
+      };
+      return certs;
+    },
+    {
+      maxRetries: 2,
+      baseDelayMs: 200,
+      maxDelayMs: 2000,
+      timeoutMs: 8000
+    }
+  );
+};
+
+const verifyFirebaseIdToken = async (token: string): Promise<{ uid: string; email?: string }> => {
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Token malformado.');
+  }
+
+  const header = safeJsonParse<{ alg?: string; kid?: string }>(decodeBase64Url(parts[0]).toString('utf8'));
+  const payload = safeJsonParse<{
+    aud?: string;
+    iss?: string;
+    sub?: string;
+    exp?: number;
+    iat?: number;
+    email?: string;
+  }>(decodeBase64Url(parts[1]).toString('utf8'));
+
+  if (!header || !payload || header.alg !== 'RS256' || !header.kid) {
+    throw new Error('Token no válido.');
+  }
+
+  const certs = await getFirebasePublicCerts();
+  const cert = certs[header.kid];
+  if (!cert) {
+    throw new Error('Certificado Firebase desconocido.');
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${parts[0]}.${parts[1]}`);
+  verifier.end();
+
+  if (!verifier.verify(cert, decodeBase64Url(parts[2]))) {
+    throw new Error('Firma de token no válida.');
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (payload.aud !== firebaseProjectId) throw new Error('Audiencia de token inválida.');
+  if (payload.iss !== `https://securetoken.google.com/${firebaseProjectId}`) throw new Error('Emisor de token inválido.');
+  if (!payload.sub || payload.sub.length > 128) throw new Error('Usuario de token inválido.');
+  if (!payload.exp || payload.exp <= nowSeconds) throw new Error('Token expirado.');
+  if (!payload.iat || payload.iat > nowSeconds + 300) throw new Error('Token emitido en el futuro.');
+
+  return { uid: payload.sub, email: payload.email };
+};
+
+const requireFirebaseAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  const authHeader = req.headers.authorization || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).json({ error: 'Autenticación requerida.' });
+  }
+
+  try {
+    req.auth = await verifyFirebaseIdToken(match[1]);
+    return next();
+  } catch (error) {
+    console.warn('Rejected API request with invalid Firebase token:', error instanceof Error ? error.message : error);
+    return res.status(401).json({ error: 'Token de autenticación inválido o expirado.' });
+  }
+};
+
+  // Helper to run Gemini models in sequence via OpenRouter (using OpenRouter API Key)
+  const callGemini = async (prompt: string): Promise<string | null> => {
+    const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+    if (!apiKey) {
+      console.warn("Falta la API Key de OpenRouter para realizar la consulta de Gemini.");
+      return null;
+    }
+
+    // Ordered list of Gemini models on OpenRouter (free tier/low cost models)
+    const modelsToTry = [
+      "google/gemini-2.5-flash:free",
+      "google/gemini-2.5-pro:free",
+      "google/gemini-flash-1.5-8b:free",
+      "google/gemma-2-9b-it:free"
+    ];
+
+    for (const modelName of modelsToTry) {
+      try {
+        console.log(`Calling OpenRouter (Gemini Route) with model ${modelName}...`);
+        const content = await withExponentialBackoff(
+          async (signal) => {
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              signal,
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+                "HTTP-Referer": "https://sqm-litio.vercel.app",
+                "X-Title": "SQM Logistics Dashboard"
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3,
+                max_tokens: 2048
+              })
+            });
+
+            if (!response.ok) {
+              throw new HttpServiceError(`OpenRouter Gemini HTTP ${response.status}`, response.status);
+            }
+
+            const json = await response.json();
+            return json.choices?.[0]?.message?.content || null;
+          },
+          {
+            maxRetries: 2,
+            baseDelayMs: 300,
+            maxDelayMs: 2500,
+            timeoutMs: 12000,
+            onRetry: (_err, attempt, delayMs) => {
+              console.warn(`[OpenRouter Gemini] Reintento #${attempt} para ${modelName} en ${delayMs}ms...`);
+            }
+          }
+        );
+
+        if (content) {
+          return content;
+        }
+      } catch (e) {
+        console.log(`[OpenRouter Gemini Fallback] Problem calling ${modelName}: ${e instanceof Error ? e.message : e}. Trying next...`);
+      }
+    }
+    return null;
+  };
+
+  // Helper to run OpenRouter Gemma models in sequence (free tier models)
+  const callOpenRouter = async (prompt: string): Promise<{ text: string; modelUsed: string } | null> => {
+    const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+    if (!apiKey) return null;
+
+    // Ordered list of models to try (including Gemma 4 31B, Gemma 4 26B, openrouter/free, and Llama 3.3 free tier versions)
+    const modelsToTry = [
+      "google/gemma-4-31b-it:free",
+      "google/gemma-4-26b-a4b-it:free",
+      "openrouter/free",
+      "meta-llama/llama-3.3-70b-instruct:free",
+      "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    ];
+
+    for (const modelName of modelsToTry) {
+      try {
+        console.log(`Calling OpenRouter with model ${modelName}...`);
+        const content = await withExponentialBackoff(
+          async (signal) => {
+            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+              method: "POST",
+              signal,
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+                "HTTP-Referer": "https://sqm-litio.vercel.app",
+                "X-Title": "SQM Logistics Dashboard"
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3,
+                max_tokens: 2048
+              })
+            });
+
+            if (!response.ok) {
+              throw new HttpServiceError(`OpenRouter HTTP ${response.status}`, response.status);
+            }
+
+            const json = await response.json();
+            return json.choices?.[0]?.message?.content || null;
+          },
+          {
+            maxRetries: 2,
+            baseDelayMs: 300,
+            maxDelayMs: 2500,
+            timeoutMs: 12000,
+            onRetry: (_err, attempt, delayMs) => {
+              console.warn(`[OpenRouter Recovery] Reintento #${attempt} para ${modelName} en ${delayMs}ms...`);
+            }
+          }
+        );
+
+        if (content) {
+          return { text: content, modelUsed: modelName };
+        }
+      } catch (e) {
+        console.log(`[OpenRouter Recovery] Problem calling ${modelName}: ${e instanceof Error ? e.message : e}. Attempting fallback...`);
+      }
+    }
+    return null;
+  };
+
+  // API routes FIRST
+  app.use('/sda', express.static(path.join(process.cwd(), 'sda')));
+
+  app.post("/api/test-ai", aiEndpointLimiter, requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const model = isAllowedModel(req.body?.model) ? req.body.model : 'gemini';
+      const startTime = Date.now();
+      const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+
+      if (!apiKey) {
+        return res.status(400).json({
+          success: false,
+          message: "Falta la variable de entorno 'OPENROUTER_API_KEY' en el servidor. Configure la clave de OpenRouter en Configuración o en su archivo .env para habilitar el servicio de IA."
+        });
+      }
+
+      if (model === "glm") {
+        try {
+          const result = await callOpenRouter("Responde únicamente con la palabra 'OK'.");
+          if (result && result.text) {
+            const latency = Date.now() - startTime;
+            return res.json({
+              success: true,
+              message: "Conectividad exitosa con OpenRouter AI (Gemma Free). El modelo está respondiendo de forma óptima.",
+              latencyMs: latency,
+              modelUsed: result.modelUsed
+            });
+          }
+          return res.status(500).json({
+            success: false,
+            message: "OpenRouter respondió con un texto vacío o no válido."
+          });
+        } catch (err: any) {
+          return res.status(500).json({
+            success: false,
+            message: `Error al conectar con OpenRouter (Gemma): ${err.message || err}`
+          });
+        }
+      }
+
+      // Default to Gemini (now queried securely via OpenRouter!)
+      try {
+        const text = await callGemini("Responde únicamente con la palabra 'OK'.");
+        if (text) {
+          const latency = Date.now() - startTime;
+          return res.json({
+            success: true,
+            message: "Conectividad exitosa con Google Gemini (canalizado de forma segura vía OpenRouter). El modelo está respondiendo de forma óptima.",
+            latencyMs: latency,
+            modelUsed: "google/gemini-2.5-flash:free (vía OpenRouter)"
+          });
+        }
+        return res.status(500).json({
+          success: false,
+          message: "El modelo Gemini en OpenRouter respondió con un texto vacío o no válido."
+        });
+      } catch (err: any) {
+        return res.status(500).json({
+          success: false,
+          message: `Fallo de conexión o autenticación con Google Gemini vía OpenRouter: ${err.message || err}`
+        });
+      }
+    } catch (outerErr: any) {
+      return res.status(500).json({
+        success: false,
+        message: `Error general en el diagnóstico de IA: ${outerErr.message || outerErr}`
+      });
+    }
+  });
+
+  app.post("/api/analyze-shift", aiEndpointLimiter, requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (jsonSize(req.body) > MAX_AI_BODY_CHARS) {
+        return res.status(413).json({ error: "La solicitud de análisis excede el tamaño permitido." });
+      }
+
+      const title = cleanText(req.body?.title, 120) || 'Operación';
+      const data = sanitizeOperationalRows(req.body?.data, 80);
+      const complianceData = sanitizeComplianceRows(req.body?.complianceData);
+      const model = isAllowedModel(req.body?.model) ? req.body.model : 'gemini';
+
+      if (data.length === 0) {
+        return res.status(400).json({ error: "No hay datos operativos válidos para analizar." });
+      }
+      
+      const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+      if (!apiKey) {
+        console.warn("OPENROUTER_API_KEY is not defined in env.");
+        return res.status(500).json({ error: "La API Key de OpenRouter no está configurada. Configure la clave de OpenRouter en Configuración para activar los servicios de IA." });
+      }
+
+      // Format data and prompt
+      const prompt = `
+Actúa como un Especialista Senior de SQM Litio. Tu tarea es analizar las desviaciones operativas e informes de rendimiento de la jornada en la faena "${title}".
+
+A continuación tienes los datos de producción de la jornada:
+${JSON.stringify(data, null, 2)}
+
+Y las correspondientes justificaciones o comentarios de desempeño reportados para los productos:
+${JSON.stringify(complianceData, null, 2)}
+
+Por favor, elabora un análisis ejecutivo estructurado en español chileno/profesional que resuma las desviaciones ocurridas basándose en los datos y principalmente en los cuadros de "Justificación de Desempeño" provistos.
+
+Sigue esta estructura limpia en Markdown con títulos profesionales en negrita:
+1. ### **Resumen Ejecutivo**: Una síntesis de las operaciones de la jornada, indicando el total programado y cargado, y el porcentaje general de cumplimiento.
+2. ### **Análisis de Desviaciones de Desempeño**: Un análisis minucioso y detallado de las desviaciones y eventos anómalos basándote directamente en las "Justificación de Desempeño" reportadas en los archivos JSON. Si no hay registros de un producto específico, descríbelo de manera ejecutiva según las desviaciones de tiempos (horas reales vs meta).
+3. ### **Rendimiento Operativo Clave**: Compara la planificación horaria contra el desempeño real (horas promedio de faena meta y real). Identifica el producto con mejor cumplimiento y el de mayor desviación.
+
+Reglas:
+- Sé directo y profesional, evita introducciones informales.
+- Utiliza terminología minera y logística formal apropiada para SQM (ej. boletería, romana, zona de carguío, unidades de pesaje, saturación de flujo, dotación, etc.).
+- No inventes justificaciones que no provengan del contexto de horas/tonelajes o justificaciones provistas en los datos adjuntos, pero interpreta la correlación entre las incidencias reportadas (ej. fallas mecánicas, esperas en romana) y los retrasos mostrados en los números.
+`;
+
+      // Check if user requested the Gemma (OpenRouter) model
+      if (model === "glm") {
+        try {
+          const orResult = await callOpenRouter(prompt);
+          if (orResult && orResult.text) {
+            return res.json({
+              analysis: orResult.text + `\n\n---\n\n*Análisis generado con **Gemma (OpenRouter Free)** [Motor: ${orResult.modelUsed}]*`
+            });
+          } else {
+            // Fallback to Gemini via OpenRouter
+            const geminiText = await callGemini(prompt);
+            if (geminiText) {
+              return res.json({
+                analysis: geminiText + `\n\n---\n\n*(Nota: Se activó Gemini de respaldo en OpenRouter debido a que Gemma no devolvió una respuesta válida)*`
+              });
+            }
+          }
+        } catch (orErr: any) {
+          console.error("Failed to fetch from OpenRouter Gemma:", orErr);
+          const geminiText = await callGemini(prompt);
+          if (geminiText) {
+            return res.json({
+              analysis: geminiText + `\n\n---\n\n*(Nota: Se activó Gemini de respaldo en OpenRouter debido a un error de conexión con Gemma: ${orErr.message || orErr})*`
+            });
+          }
+        }
+      }
+
+      // Default to Gemini (now queried securely via OpenRouter!)
+      const geminiText = await callGemini(prompt);
+      if (geminiText) {
+        res.json({ analysis: geminiText + `\n\n---\n\n*Análisis generado con **Google Gemini** [Vía OpenRouter]*` });
+      } else {
+        console.log("Serving local analytic fallback.");
+        res.json({
+          analysis: null,
+          info: "Los servidores de IA están experimentando alta demanda. Se ha activado el motor de análisis local de respaldo."
+        });
+      }
+    } catch (outerException: any) {
+      console.log("Request handled via backup routine.", outerException);
+      res.json({ 
+        analysis: null, 
+        info: "Servicio en mantención de carga. Procesado por el motor local de respaldo." 
+      });
+    }
+  });
+
+  // NEW: Refine performance justification with AI secure endpoint
+  app.post("/api/refine-justification", aiEndpointLimiter, requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (jsonSize(req.body) > 40_000) {
+        return res.status(413).json({ error: "La solicitud de formalización excede el tamaño permitido." });
+      }
+
+      const text = cleanText(req.body?.text, 2000);
+      const product = cleanText(req.body?.product, 120) || 'Producto no informado';
+      const rawStats = req.body?.stats && typeof req.body.stats === 'object' ? req.body.stats : {};
+      const stats = jsonSize(rawStats) <= 8_000 ? rawStats : {};
+      const model = isAllowedModel(req.body?.model) ? req.body.model : 'gemini';
+
+      const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: "La API Key de OpenRouter no está configurada. Configure su API Key en el panel de Configuración para continuar." });
+      }
+
+      const prompt = `
+Actúa como un Especialista Senior de SQM Litio. Tu misión es redactar una justificación profesional, BREVE, EJECUTIVA y TÉCNICA (máximo 2 oraciones) para el reporte de desempeño.
+
+Información operativa de referencia:
+- Producto: ${product}
+- Detalles: ${JSON.stringify(stats || {}, null, 2)}
+
+Borrador/Observación original del supervisor:
+"${text || 'Sin observación manual'}"
+
+REGLAS CRÍTICAS DE REDACCIÓN:
+- Transforma el borrador en un texto formal, profesional y elegante apto para la gerencia.
+- Utiliza terminología logística profesional (congestión logística, desviaciones de ciclo, saturación de flujo, transición de dotación, incidentes mecánicos, etc.).
+- Entrega ÚNICAMENTE el texto formalizado/justificación refinada, sin comentarios adicionales ni preámbulos.
+- Mantén la máxima concisión. No inventes datos que no estén expresados o implícitos en el borrador original o los detalles estadísticos.
+- Siempre usa la abreviatura "ton." en minúscula para toneladas si llegas a mencionarlas.
+- Si mencionas o calculas cualquier tiempo, duración o retraso (por ejemplo: "2.53 h", "1.5 h", "45 min"), debes expresarlo obligatoriamente en formato de horas y minutos "HH:MM" (por ejemplo: "02:32", "01:30", "00:45"). NUNCA uses decimales para las horas.
+`;
+
+      if (model === "glm") {
+        try {
+          const orResult = await callOpenRouter(prompt);
+          if (orResult && orResult.text) {
+            return res.json({ refined: orResult.text.trim().replace(/^["']|["']$/g, '') });
+          }
+        } catch (orErr) {
+          console.error("OpenRouter Refinement failed, falling back to Gemini via OpenRouter:", orErr);
+        }
+      }
+
+      // Default to Gemini (now secure via OpenRouter!)
+      const geminiText = await callGemini(prompt);
+      if (geminiText) {
+        return res.json({ refined: geminiText.trim().replace(/^["']|["']$/g, '') });
+      } else {
+        return res.status(500).json({ error: "No se pudo procesar la reescritura con IA en este momento." });
+      }
+    } catch (e: any) {
+      console.error("Error in refine-justification route:", e);
+      res.status(500).json({ error: e.message || "Error interno del servidor." });
+    }
+  });
+
+  // Helper for server-side decimal hours conversion to HH:MM
+  const formatDecimalToHHMM = (decimalValue: number): string => {
+    if (isNaN(decimalValue) || decimalValue === null) return "00:00";
+    const absoluteHours = Math.floor(Math.abs(decimalValue));
+    const minutes = Math.round((Math.abs(decimalValue) - absoluteHours) * 60);
+    const formattedHours = absoluteHours.toString().padStart(2, "0");
+    const formattedMinutes = minutes.toString().padStart(2, "0");
+    return `${decimalValue < 0 ? "-" : ""}${formattedHours}:${formattedMinutes}`;
+  };
+
+  // SERVER-SIDE HIGH-PRECISION PDF GENERATION
+  app.post("/api/generate-pdf", requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const title = cleanText(req.body?.title, 80) || 'SQM';
+      const data = sanitizeOperationalRows(req.body?.data, MAX_PDF_ROWS);
+      const rawRange = req.body?.range && typeof req.body.range === 'object' ? req.body.range : {};
+      const range = {
+        start: cleanText((rawRange as Record<string, unknown>).start, 32),
+        end: cleanText((rawRange as Record<string, unknown>).end, 32)
+      };
+      const analysis = cleanText(req.body?.analysis, MAX_ANALYSIS_CHARS);
+      const operatorName = cleanText(req.body?.operatorName, 80);
+      const filenameTitle = cleanFilenamePart(title);
+
+      // Create PDF Document in A4 with safe margins
+      const doc = new PDFDocument({
+        size: 'A4',
+        bufferPages: true,
+        margins: { top: 120, bottom: 80, left: 50, right: 50 }
+      });
+
+      const chunks: Buffer[] = [];
+      doc.on('data', (chunk) => chunks.push(chunk));
+      doc.on('end', () => {
+        const pdfBuffer = Buffer.concat(chunks);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="Reporte_Turno_Servidor_${filenameTitle}.pdf"`);
+        res.status(200).send(pdfBuffer);
+      });
+
+      // --- PAGE 1: CONTENT ---
+      // 1. Control Information Box (Metadata)
+      doc.rect(50, 120, 495, 45).fill('#FAF5E6');
+      doc.rect(50, 120, 495, 45).lineWidth(1).stroke('#E2D8C0');
+
+      doc.fillColor('#461D77').font('Helvetica-Bold').fontSize(9);
+      doc.text("INFORMACIÓN DE CONTROL OPERATIVO - SERVIDOR", 60, 128);
+
+      doc.fillColor('#334155').font('Helvetica').fontSize(8);
+      const periodStr = `Periodo Consultado: ${range.start || 'Historial Completo'} hasta ${range.end || 'Historial Completo'}`;
+      doc.text(periodStr, 60, 142);
+
+      const formattedToday = new Date().toLocaleDateString('es-CL', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      const generatedByStr = `Generado el: ${formattedToday} ${operatorName ? `· Operador: ${operatorName}` : ''}`;
+      doc.text(generatedByStr, 60, 153);
+
+      // Move down below metadata box
+      doc.y = 180;
+
+      // 2. KPI Cards
+      const totalProg = data.reduce((acc: number, d: any) => acc + (d.Ton_Prog || 0), 0);
+      const totalReal = data.reduce((acc: number, d: any) => acc + (d.Ton_Real || 0), 0);
+      const complPct = totalProg > 0 ? (totalReal / totalProg) * 100 : 0;
+
+      // Draw Card 1: TOTAL PROGRAMADO
+      doc.rect(50, 180, 155, 45).fill('#F8FAFC');
+      doc.rect(50, 180, 155, 45).lineWidth(0.5).stroke('#CBD5E1');
+      doc.fillColor('#64748B').font('Helvetica-Bold').fontSize(7.5);
+      doc.text("TOTAL PROGRAMADO", 58, 188);
+      doc.fillColor('#461D77').font('Helvetica-Bold').fontSize(12);
+      doc.text(`${Math.round(totalProg).toLocaleString('es-CL')} Ton`, 58, 202);
+
+      // Draw Card 2: TOTAL REAL CARGADO
+      doc.rect(220, 180, 155, 45).fill('#F8FAFC');
+      doc.rect(220, 180, 155, 45).lineWidth(0.5).stroke('#CBD5E1');
+      doc.fillColor('#64748B').font('Helvetica-Bold').fontSize(7.5);
+      doc.text("TOTAL REAL CARGADO", 228, 188);
+      doc.fillColor('#7177EC').font('Helvetica-Bold').fontSize(12);
+      doc.text(`${Math.round(totalReal).toLocaleString('es-CL')} Ton`, 228, 202);
+
+      // Draw Card 3: CUMPLIMIENTO NETO
+      doc.rect(390, 180, 155, 45).fill('#F8FAFC');
+      doc.rect(390, 180, 155, 45).lineWidth(0.5).stroke('#CBD5E1');
+      doc.fillColor('#64748B').font('Helvetica-Bold').fontSize(7.5);
+      doc.text("CUMPLIMIENTO NETO", 398, 188);
+      doc.fillColor(complPct >= 100 ? '#10B981' : complPct >= 85 ? '#F59E0B' : '#EF4444').font('Helvetica-Bold').fontSize(12);
+      doc.text(`${complPct.toFixed(1)}%`, 398, 202);
+
+      // Move down below cards
+      doc.y = 240;
+
+      // 3. Table Header
+      doc.moveDown(1);
+      const tableHeaderY = doc.y;
+      doc.rect(50, tableHeaderY, 495, 20).fill('#461D77');
+      doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(8);
+      doc.text("PRODUCTO", 55, tableHeaderY + 6, { width: 140 });
+      doc.text("PLANIF. TON", 195, tableHeaderY + 6, { width: 80, align: 'right' });
+      doc.text("REAL TON", 275, tableHeaderY + 6, { width: 80, align: 'right' });
+      doc.text("CUMPL %", 355, tableHeaderY + 6, { width: 70, align: 'right' });
+      doc.text("META HRS", 425, tableHeaderY + 6, { width: 60, align: 'right' });
+      doc.text("REAL HRS", 485, tableHeaderY + 6, { width: 60, align: 'right' });
+
+      // 4. Table Rows
+      let currentY = tableHeaderY + 20;
+      data.forEach((item: any, idx: number) => {
+        // If row goes near footer, add page and reset headers
+        if (currentY > 700) {
+          doc.addPage();
+          currentY = 120; // reset to top safe zone
+          
+          doc.rect(50, currentY, 495, 20).fill('#461D77');
+          doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(8);
+          doc.text("PRODUCTO", 55, currentY + 6, { width: 140 });
+          doc.text("PLANIF. TON", 195, currentY + 6, { width: 80, align: 'right' });
+          doc.text("REAL TON", 275, currentY + 6, { width: 80, align: 'right' });
+          doc.text("CUMPL %", 355, currentY + 6, { width: 70, align: 'right' });
+          doc.text("META HRS", 425, currentY + 6, { width: 60, align: 'right' });
+          doc.text("REAL HRS", 485, currentY + 6, { width: 60, align: 'right' });
+          currentY += 20;
+        }
+
+        const isEven = idx % 2 === 0;
+        doc.rect(50, currentY, 495, 20).fill(isEven ? '#F8FAFC' : '#FFFFFF');
+        doc.rect(50, currentY + 19, 495, 1).fill('#F1F5F9');
+
+        const rowCompliance = item.Ton_Prog > 0 ? (item.Ton_Real / item.Ton_Prog) * 100 : 0;
+
+        doc.fillColor('#1E293B').font('Helvetica-Bold').fontSize(8);
+        doc.text(item.name || item.producto || 'SIN NOMBRE', 55, currentY + 6, { width: 140, ellipsis: true });
+
+        doc.font('Helvetica').fillColor('#64748B');
+        doc.text(Math.round(item.Ton_Prog).toLocaleString('es-CL'), 195, currentY + 6, { width: 80, align: 'right' });
+
+        doc.font('Helvetica-Bold').fillColor('#461D77');
+        doc.text(Math.round(item.Ton_Real).toLocaleString('es-CL'), 275, currentY + 6, { width: 80, align: 'right' });
+
+        doc.font('Helvetica-Bold').fillColor(rowCompliance >= 100 ? '#10B981' : rowCompliance >= 85 ? '#F59E0B' : '#EF4444');
+        doc.text(`${rowCompliance.toFixed(1)}%`, 355, currentY + 6, { width: 70, align: 'right' });
+
+        doc.font('Helvetica').fillColor('#64748B');
+        doc.text(formatDecimalToHHMM(item.faenaMetaHours), 425, currentY + 6, { width: 60, align: 'right' });
+        doc.text(formatDecimalToHHMM(item.faenaRealHours), 485, currentY + 6, { width: 60, align: 'right' });
+
+        currentY += 20;
+      });
+
+      // 5. Analysis Section
+      doc.y = currentY + 15;
+      
+      // Ensure we have room for title
+      if (doc.y > 680) {
+        doc.addPage();
+      }
+
+      doc.moveDown(1);
+      doc.fillColor('#461D77').font('Helvetica-Bold').fontSize(11);
+      doc.text("ANÁLISIS EJECUTIVO DE DESVIACIONES", { underline: true });
+      doc.moveDown(0.6);
+
+      // Render formatted markdown lines
+      if (analysis) {
+        const lines = analysis.split('\n');
+        lines.forEach((line: string) => {
+          let text = line.trim();
+          if (!text) {
+            doc.moveDown(0.4);
+            return;
+          }
+
+          // Handle headers
+          if (text.startsWith('###')) {
+            const hText = text.replace(/^###\s*\**|\**$/g, '').trim();
+            if (doc.y > 700) doc.addPage();
+            doc.moveDown(0.5);
+            doc.font('Helvetica-Bold').fontSize(10).fillColor('#461D77');
+            doc.text(hText);
+            doc.moveDown(0.3);
+          } else if (text.startsWith('##')) {
+            const hText = text.replace(/^##\s*\**|\**$/g, '').trim();
+            if (doc.y > 700) doc.addPage();
+            doc.moveDown(0.7);
+            doc.font('Helvetica-Bold').fontSize(11).fillColor('#461D77');
+            doc.text(hText);
+            doc.moveDown(0.4);
+          } else if (text.startsWith('-') || text.startsWith('*')) {
+            const bulletText = text.substring(1).trim().replace(/\*\*/g, '');
+            if (doc.y > 720) doc.addPage();
+            doc.font('Helvetica').fontSize(9).fillColor('#334155');
+            doc.text('• ' + bulletText, { indent: 12, paragraphGap: 3, lineGap: 1.5 });
+          } else {
+            const cleanText = text.replace(/\*\*/g, '');
+            if (doc.y > 720) doc.addPage();
+            doc.font('Helvetica').fontSize(9).fillColor('#334155');
+            doc.text(cleanText, { paragraphGap: 5, lineGap: 1.5 });
+          }
+        });
+      } else {
+        doc.font('Helvetica-Oblique').fontSize(9).fillColor('#94A3B8');
+        doc.text("No se ha registrado análisis operativo de desviaciones para este periodo.");
+      }
+
+      // --- SECOND-PASS OVERLAY: HEADERS AND FOOTERS ---
+      const pages = doc.bufferedPageRange();
+      for (let i = 0; i < pages.count; i++) {
+        doc.switchToPage(i);
+
+        // Header Background Banner
+        doc.rect(50, 40, 495, 60).fill('#461D77');
+        
+        // Header Texts
+        doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(12);
+        doc.text("SQM LITIO - SISTEMA DE GESTIÓN LOGÍSTICA", 65, 55);
+
+        doc.fillColor('#DCDCE1').font('Helvetica').fontSize(8.5);
+        doc.text(`REPORTE DE CAMBIO DE TURNO (SERVERSIDE): ${title ? title.toUpperCase() : 'DESCONOCIDO'}`, 65, 75);
+
+        // Teal separator line
+        doc.rect(50, 100, 495, 3).fill('#4FD1C5');
+
+        // Footer Separator
+        doc.rect(50, 775, 495, 1).fill('#E2E8F0');
+
+        // Footer Texts
+        doc.fillColor('#8C8C96').font('Helvetica').fontSize(7.5);
+        doc.text("CONFIDENCIAL · SISTEMA DE REPORTABILIDAD LOGÍSTICA SQM LITIO", 50, 785);
+
+        const pageNumText = `Página ${i + 1} de ${pages.count}`;
+        doc.text(pageNumText, 545 - doc.widthOfString(pageNumText), 785);
+      }
+
+      doc.end();
+
+    } catch (err: any) {
+      console.error("Error generating server-side PDF:", err);
+      res.status(500).json({ error: "No se pudo generar el reporte PDF en el servidor.", details: err.message });
+    }
+  });
+
+  // ==========================================
+  // REPORTE STOKES - BACKEND PROXY (SSRS NTLM)
+  // ==========================================
+  const REPORT_SERVER_URL = process.env.REPORT_SERVER_URL || 'http://clanfdbsw06/ReportServer';
+  const REPORT_PATH = '/produccion/operaciones/canchas/publico/Historico_guia_transportista';
+
+  const normalizarAlmacenDespacho = (raw: string): string => {
+    if (!raw) return '—';
+    const trimmed = raw.trim();
+    if (/^Salar Atacama,\s*Mop/i.test(trimmed) || trimmed.toLowerCase().includes('salar')) {
+      return 'Salar';
+    }
+    return trimmed;
+  };
+
+  const procesarFilasStokes = (rawRows: any[][]) => {
+    if (!rawRows || rawRows.length === 0) return [];
+
+    let headerRowIdx = -1;
+    let colGuia = 0;
+    let colFecha = 1;
+    let colProd = 10;
+    let colCant = 13;
+    let colAlmDesp = 14;
+    let colAlmDest = 15;
+    let colTransp = 17;
+    let colPat = 20;
+
+    for (let i = 0; i < Math.min(rawRows.length, 12); i++) {
+      const r = rawRows[i];
+      if (!Array.isArray(r)) continue;
+      const rStr = r.map(c => String(c || '').toLowerCase().trim());
+      if (rStr.some(c => c.includes('guía') || c.includes('guia') || c.includes('n° guia'))) {
+        headerRowIdx = i;
+        r.forEach((cellVal, idx) => {
+          const val = String(cellVal || '').toLowerCase().trim();
+          if (val.includes('guía') || val.includes('guia')) colGuia = idx;
+          else if (val.includes('fecha')) colFecha = idx;
+          else if (val.includes('producto')) colProd = idx;
+          else if (val.includes('cant') && val.includes('desp')) colCant = idx;
+          else if (val.includes('almacen despacho') || val.includes('almacén despacho')) colAlmDesp = idx;
+          else if (val.includes('almacen destino') || val.includes('almacén destino')) colAlmDest = idx;
+          else if (val.includes('transportista')) colTransp = idx;
+          else if (val.includes('patente')) colPat = idx;
+        });
+        break;
+      }
+    }
+
+    const startRow = headerRowIdx !== -1 ? headerRowIdx + 1 : 8;
+
+    return rawRows.slice(startRow).filter(row => {
+      if (!row || row.length === 0) return false;
+      const g = String(row[colGuia] || row[0] || '').trim();
+      return g && !g.toLowerCase().includes('histórico') && !g.toLowerCase().includes('guía');
+    }).map(row => {
+      const almDesp = String(row[colAlmDesp] ?? row[14] ?? row[10] ?? '').trim();
+      const origenNormalizado = normalizarAlmacenDespacho(almDesp);
+
+      const rawCant = row[colCant] ?? row[13] ?? row[9];
+      let cantNum = 0;
+      if (rawCant !== undefined && rawCant !== null) {
+        const numStr = String(rawCant).replace(',', '.').replace(/[^\d.-]/g, '');
+        cantNum = parseFloat(numStr) || 0;
+      }
+
+      return {
+        guia: String(row[colGuia] ?? row[0] ?? '').trim(),
+        fechaGuia: String(row[colFecha] ?? row[1] ?? '').trim(),
+        producto: String(row[colProd] ?? row[10] ?? row[6] ?? '').trim(),
+        cantDespacho: cantNum,
+        almacenDespachoRaw: almDesp,
+        origenStokes: origenNormalizado,
+        almacenDestino: String(row[colAlmDest] ?? row[15] ?? row[11] ?? '').trim(),
+        transportista: String(row[colTransp] ?? row[17] ?? row[13] ?? '').trim(),
+        patenteCamion: String(row[colPat] ?? row[20] ?? row[16] ?? '').trim()
+      };
+    });
+  };
+
+  app.post('/api/reporte-stokes', stokesEndpointLimiter, requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    const username = cleanText(req.body?.username, MAX_STOKES_PARAM_CHARS);
+    const password = typeof req.body?.password === 'string' ? req.body.password.slice(0, 256) : '';
+    const domain = cleanText(req.body?.domain, MAX_STOKES_PARAM_CHARS);
+    const fechaInicio = cleanText(req.body?.fechaInicio, 32);
+    const fechaFin = cleanText(req.body?.fechaFin, 32);
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Usuario y contraseña corporativa requeridos' });
+    }
+
+    let cleanUsername = String(username).trim();
+    let cleanDomain = String(domain || '').trim();
+
+    // Soporte para formato DOMAIN\usuario o usuario@dominio
+    if (cleanUsername.includes('\\')) {
+      const parts = cleanUsername.split('\\');
+      cleanDomain = parts[0];
+      cleanUsername = parts[1];
+    } else if (cleanUsername.includes('@')) {
+      const parts = cleanUsername.split('@');
+      cleanUsername = parts[0];
+      cleanDomain = parts[1];
+    }
+
+    const baseServerUrl = REPORT_SERVER_URL;
+    let urlReporte = `${baseServerUrl}?${encodeURIComponent(REPORT_PATH)}&rs:Command=Render&rs:Format=EXCELOPENXML`;
+    if (fechaInicio && /^\d{4}-\d{2}-\d{2}$/.test(fechaInicio)) {
+      urlReporte += `&FechaInicio=${encodeURIComponent(fechaInicio)}`;
+    }
+    if (fechaFin && /^\d{4}-\d{2}-\d{2}$/.test(fechaFin)) {
+      urlReporte += `&FechaFin=${encodeURIComponent(fechaFin)}`;
+    }
+
+    console.log(`[Stokes Proxy] Conectando a ReportServer corporativo autorizado (${baseServerUrl}).`);
+
+    const executeNtlmRequest = () =>
+      new Promise<any>((resolve, reject) => {
+        httpntlm.get(
+          {
+            url: urlReporte,
+            username: cleanUsername,
+            password,
+            workstation: '',
+            domain: cleanDomain,
+            binary: true
+          },
+          (err: any, response: any) => {
+            if (err) return reject(err);
+            if (response.statusCode === 401) {
+              return reject(new HttpServiceError('Credenciales corporativas rechazadas (Error 401: No autorizado)', 401, false));
+            }
+            if (response.statusCode >= 500 || response.statusCode === 429) {
+              return reject(new HttpServiceError(`ReportServer HTTP ${response.statusCode}`, response.statusCode, true));
+            }
+            resolve(response);
+          }
+        );
+      });
+
+    try {
+      const response = await withExponentialBackoff(executeNtlmRequest, {
+        maxRetries: 2,
+        baseDelayMs: 350,
+        maxDelayMs: 3000,
+        timeoutMs: 20000,
+        shouldRetry: (err) => {
+          const errObj = err as { code?: string; message?: string };
+          const msg = String(errObj?.message || err || '');
+          if (
+            errObj?.code === 'EAI_AGAIN' ||
+            errObj?.code === 'ENOTFOUND' ||
+            errObj?.code === 'ECONNREFUSED' ||
+            msg.includes('EAI_AGAIN') ||
+            msg.includes('clanfdbsw06')
+          ) {
+            return false;
+          }
+          return defaultShouldRetry(err);
+        },
+        onRetry: (_err, attempt, delayMs) => {
+          console.warn(`[Stokes Proxy] Reintento NTLM #${attempt} en ${delayMs}ms...`);
+        }
+      });
+
+      if (response.statusCode !== 200) {
+        return res.status(response.statusCode || 500).json({
+          error: `ReportServer devolvió un código HTTP ${response.statusCode}`,
+          detail: response.body ? response.body.toString().slice(0, 300) : 'Sin respuesta detallada'
+        });
+      }
+
+      try {
+        const workbook = XLSX.read(response.body, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0];
+        const rawRows: any[][] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1 });
+        const despachosProcesados = procesarFilasStokes(rawRows);
+
+        console.log(`[Stokes Proxy] Reporte procesado exitosamente: ${despachosProcesados.length} registros despachados.`);
+
+        return res.json({
+          totalRegistros: despachosProcesados.length,
+          data: despachosProcesados
+        });
+      } catch (parseError: any) {
+        console.warn('[Stokes Proxy] Error al procesar Excel descargado:', parseError.message);
+        return res.status(500).json({
+          error: 'Error al procesar el archivo Excel descargado desde ReportServer',
+          detail: parseError.message
+        });
+      }
+    } catch (err: any) {
+      if (err instanceof HttpServiceError && err.status === 401) {
+        return res.status(401).json({
+          error: 'Credenciales corporativas rechazadas (Error 401: No autorizado)',
+          detail: 'Verifique su usuario de red y contraseña en ReportServer.'
+        });
+      }
+
+      const errMsg = String(err?.message || err);
+      const isDnsOrUnreachable =
+        err?.code === 'EAI_AGAIN' ||
+        err?.code === 'ENOTFOUND' ||
+        err?.code === 'ECONNREFUSED' ||
+        err?.code === 'ETIMEDOUT' ||
+        errMsg.includes('EAI_AGAIN') ||
+        errMsg.includes('clanfdbsw06');
+
+      if (isDnsOrUnreachable) {
+        console.log(`[Stokes Proxy] Host interno 'clanfdbsw06' no es resoluble directamente desde este contenedor en la nube (requiere Intranet/VPN SQM). Cargando contingencia oficial.`);
+        try {
+          const { DATOS_REALES_STOKES } = await import('./src/data/datosStokesHistoricos.js');
+          return res.json({
+            totalRegistros: DATOS_REALES_STOKES.length,
+            data: DATOS_REALES_STOKES,
+            isContingency: true,
+            message: 'Servidor clanfdbsw06 requiere intranet SQM o VPN. Se ha cargado el universo completo de las guías reales con variantes MOP 1-6 unificadas a "Salar".'
+          });
+        } catch {
+          return res.json({
+            totalRegistros: 0,
+            data: [],
+            isContingency: true,
+            message: 'Conexión con clanfdbsw06 no disponible en nube pública.'
+          });
+        }
+      }
+
+      console.warn('[Stokes Proxy] Aviso NTLM / Conexión:', errMsg);
+      return res.status(502).json({
+        error: 'Error de conexión con ReportServer (clanfdbsw06)',
+        detail: errMsg,
+        isConnectionError: true,
+        hint: 'El host clanfdbsw06 es un servidor interno de la intranet SQM. Si accede fuera de la red/VPN corporativa, puede cargar el archivo Excel manualmente o utilizar los datos oficiales del reporte.'
+      });
+    }
+  });
+
+  // Export the Express app for Vercel Serverless Functions
+  export default app;
+
+  if (process.env.VERCEL !== "1") {
+    const PORT = 3000;
+    if (process.env.NODE_ENV !== "production") {
+      const httpServer = http.createServer(app);
+      import("vite").then(({ createServer: createViteServer }) => {
+        createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: { server: httpServer },
+            watch: process.env.DISABLE_HMR === 'true' ? null : undefined,
+          },
+          appType: "spa",
+        }).then((vite) => {
+          app.use(vite.middlewares);
+          httpServer.listen(PORT, "0.0.0.0", () => {
+            console.log(`Server running on http://localhost:${PORT}`);
+          });
+        });
+      });
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+      });
+    }
+  }
